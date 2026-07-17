@@ -4,8 +4,8 @@
 ## Environment and Dependencies Setup
 1. Clone the repository and go to directory
 ```bash
-git clone git@github.com:jychpr/silent-street.git
-cd silent-street/
+git clone git@github.com:jychpr/quaver-quasar.git
+cd quaver-quasar/
 ```
 2. Create environment
 ```bash
@@ -14,7 +14,7 @@ conda activate QQ
 ```
 3. Run this command step by step for smooth installation of dependencies
 ```bash
-pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu128
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 ```
 ```bash
 # Meta foundational libraries
@@ -47,7 +47,7 @@ python -m pip install 'git+https://github.com/facebookresearch/detectron2.git' -
 
 Additional dependencies
 ```bash
-pip install openpyxl ultralytics
+pip install openpyxl
 ```
 
 ## Data Preparation & Checkpoints
