@@ -194,7 +194,7 @@ def main(args):
     output_dir = Path(args.output_dir)
 
     if args.resume:
-        checkpoint = torch.load(args.resume, map_location="cpu")
+        checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)  # ENV-COMPAT: torch>=2.6 defaults weights_only=True; upstream ckpt stores argparse.Namespace
         model_without_ddp.load_state_dict(checkpoint["model"])
         if args.use_ema:
             if "ema_model" in checkpoint:
