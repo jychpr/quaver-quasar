@@ -242,6 +242,7 @@ class OV_DQUO(nn.Module):
                 num_classes=len(proj_text_feature),
                 text_embbeding=proj_text_feature,
                 label_enc_embbeding=self.label_enc,
+                iou_banded_noise=getattr(self.args, "dn_iou_banded_noise", False),
             )
         else:
             dn_query_label = None
@@ -443,9 +444,13 @@ def build_ov_dquo(args):
 
     # for DN training
     if args.use_dn:
+        # dn_box_loss_weight (default 0.0 = stock): relative multiplier on the DN
+        # box loss, preserving the matching branch's L1:GIoU ratio. At 0.0 the DN
+        # box entries are weighted 0 AND the criterion emits no such keys -> stock.
+        dn_box_loss_weight = getattr(args, "dn_box_loss_weight", 0.0)
         weight_dict["loss_ce_dn"] = args.cls_loss_coef
-        weight_dict["loss_bbox_dn"] = args.bbox_loss_coef
-        weight_dict["loss_giou_dn"] = args.giou_loss_coef
+        weight_dict["loss_bbox_dn"] = args.bbox_loss_coef * dn_box_loss_weight
+        weight_dict["loss_giou_dn"] = args.giou_loss_coef * dn_box_loss_weight
 
     clean_weight_dict = copy.deepcopy(weight_dict)
 
@@ -489,6 +494,8 @@ def build_ov_dquo(args):
         weight_dict=weight_dict,
         focal_alpha=args.focal_alpha,
         losses=losses,
+        dn_box_loss_weight=getattr(args, "dn_box_loss_weight", 0.0),
+        dn_weight_negatives=getattr(args, "dn_weight_negatives", False),
     )
     criterion.to(device)
     postprocessors = {"bbox": OVPostProcess(args)}
