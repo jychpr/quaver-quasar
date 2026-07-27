@@ -1,16 +1,21 @@
 import torch
 from models.criterion.ov_criterion import OVSetCriterion
 from models.ov_dquo.utils import sigmoid_focal_loss
-from util.box_ops import box_cxcywh_to_xyxy, box_iou
-from util.misc import ( get_world_size, 
+from util.box_ops import box_cxcywh_to_xyxy, box_iou, generalized_box_iou
+from util.misc import ( get_world_size,
                        is_dist_avail_and_initialized)
 import torch.nn.functional as F
 
 
 class OVSetCriterion_Pseudo(OVSetCriterion):
     def __init__(self,**kwargs):
+        # DTQT DN-upgrade flags (defaults reproduce stock behaviour exactly)
+        dn_box_loss_weight = kwargs.pop("dn_box_loss_weight", 0.0)
+        dn_weight_negatives = kwargs.pop("dn_weight_negatives", False)
         super().__init__(**kwargs)
         self.gamma = 0.5
+        self.dn_box_loss_weight = dn_box_loss_weight
+        self.dn_weight_negatives = dn_weight_negatives
 
     def forward(self, outputs, targets):
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs' and k != 'enc_outputs'}
@@ -35,6 +40,7 @@ class OVSetCriterion_Pseudo(OVSetCriterion):
             output_known_lbs_bboxes,single_pad, scalar = self.prep_for_dn(dn_meta)
             pseudo_targets=dn_meta['pseudo_targets']
             dn_pos_idx = []
+            dn_neg_idx = []
             dn_pos_weight = []
             for i in range(len(pseudo_targets)):
                 if len(pseudo_targets[i]['labels']) > 0:
@@ -48,11 +54,16 @@ class OVSetCriterion_Pseudo(OVSetCriterion):
                     output_idx = tgt_idx = torch.tensor([]).long().cuda()
                     weight_i=torch.tensor([]).long().cuda()
                 dn_pos_idx.append((output_idx, tgt_idx))
+                if self.dn_weight_negatives:
+                    dn_neg_idx.append((output_idx + single_pad // 2, tgt_idx))
                 dn_pos_weight.append(weight_i)
             dn_pos_weight=torch.cat(dn_pos_weight)
+            neg_indices = dn_neg_idx if self.dn_weight_negatives else None
             output_known_lbs_bboxes=dn_meta['output_known_lbs_bboxes']
             l_dict = {}
-            l_dict.update(self._loss_labels_denoise(output_known_lbs_bboxes, pseudo_targets, dn_pos_idx,num_boxes*scalar,dn_pos_weight))
+            l_dict.update(self._loss_labels_denoise(output_known_lbs_bboxes, pseudo_targets, dn_pos_idx,num_boxes*scalar,dn_pos_weight, neg_indices=neg_indices))
+            if self.dn_box_loss_weight > 0:
+                l_dict.update(self._loss_boxes_denoise(output_known_lbs_bboxes, pseudo_targets, dn_pos_idx, num_boxes*scalar, dn_pos_weight))
             l_dict = {k + f'_dn': v for k, v in l_dict.items()}
             losses.update(l_dict)
         else:
@@ -99,7 +110,9 @@ class OVSetCriterion_Pseudo(OVSetCriterion):
                 if self.training and dn_meta and "output_known_lbs_bboxes" in dn_meta:
                     aux_outputs_known = output_known_lbs_bboxes["aux_outputs"][i]
                     l_dict = {}
-                    l_dict.update(self._loss_labels_denoise(aux_outputs_known, pseudo_targets, dn_pos_idx,num_boxes*scalar,dn_pos_weight))
+                    l_dict.update(self._loss_labels_denoise(aux_outputs_known, pseudo_targets, dn_pos_idx,num_boxes*scalar,dn_pos_weight, neg_indices=neg_indices))
+                    if self.dn_box_loss_weight > 0:
+                        l_dict.update(self._loss_boxes_denoise(aux_outputs_known, pseudo_targets, dn_pos_idx, num_boxes*scalar, dn_pos_weight))
                     l_dict = {k + f"_dn_{i}": v for k, v in l_dict.items()}
                     losses.update(l_dict)
                 else:
@@ -174,9 +187,9 @@ class OVSetCriterion_Pseudo(OVSetCriterion):
         losses = {"loss_ce": loss_ce}
         return losses
     
-    def _loss_labels_denoise(self,outputs, targets, indices, num_boxes,weight):
+    def _loss_labels_denoise(self,outputs, targets, indices, num_boxes,weight, neg_indices=None):
         assert "pred_logits" in outputs
-        src_logits = outputs["pred_logits"] 
+        src_logits = outputs["pred_logits"]
         idx = self._get_src_permutation_idx(indices)
         target_classes = torch.full(
             src_logits.shape[:2],
@@ -184,13 +197,13 @@ class OVSetCriterion_Pseudo(OVSetCriterion):
             dtype=torch.int64,
             device=src_logits.device,
         )
-        target_classes[idx] = 0 
+        target_classes[idx] = 0
         target_classes_onehot = torch.zeros(
             [src_logits.shape[0], src_logits.shape[1], src_logits.shape[2] + 1],
             dtype=src_logits.dtype,
             layout=src_logits.layout,
             device=src_logits.device,
-        ) 
+        )
         target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
         target_classes_onehot = target_classes_onehot[:, :, :-1]
         loss_ce = sigmoid_focal_loss(
@@ -204,10 +217,31 @@ class OVSetCriterion_Pseudo(OVSetCriterion):
         weight_mask = torch.ones_like(loss_ce)
         weight=weight.view(-1, 1)**self.gamma
         weight_mask[idx]=weight
+        # dn_weight_negatives: also weight the negative rows (same w_i as their source box)
+        if neg_indices is not None:
+            neg_idx = self._get_src_permutation_idx(neg_indices)
+            weight_mask[neg_idx] = weight
         loss_ce = loss_ce * weight_mask
         loss_ce = loss_ce.mean(1).sum() / (num_boxes) * src_logits.shape[1]
         losses = {"loss_ce": loss_ce}
         return losses
+
+    def _loss_boxes_denoise(self, outputs, targets, indices, num_boxes, weight):
+        # dn_box_loss_weight: L1 + GIoU regression between the denoised positive
+        # boxes and their source pseudo-boxes, weighted by w_i**gamma (same
+        # convention as the DN classification weighting). Mirrors OVSetCriterion.
+        # loss_boxes but gathers targets from pseudo_targets and applies w_i.
+        assert "pred_boxes" in outputs
+        idx = self._get_src_permutation_idx(indices)
+        src_boxes = outputs["pred_boxes"][idx]
+        target_boxes = torch.cat([t["boxes"][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        weight = weight.view(-1, 1) ** self.gamma
+        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction="none")
+        loss_bbox = (loss_bbox * weight).sum() / num_boxes
+        loss_giou = 1 - torch.diag(generalized_box_iou(
+            box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes)))
+        loss_giou = (loss_giou * weight.squeeze(-1)).sum() / num_boxes
+        return {"loss_bbox": loss_bbox, "loss_giou": loss_giou}
     
     def _loss_labels_vfl(self, outputs, targets, indices, num_boxes, pseudo_indices, num_pseudo_boxes, pseudo_weight, log=True, dn=False):
         focal_alpha=0.75
