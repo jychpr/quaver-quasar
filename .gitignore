@@ -492,6 +492,7 @@ outputs/
 wandb/
 CLAUDE.md
 HANDOFF.md
+.claude
 
 # Diagnostics — keep scripts/README, ignore output data
 diagnostics/

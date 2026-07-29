@@ -6,9 +6,11 @@
 """
 Transforms and data augmentation for both image + bbox.
 """
+import math
 import random
 
 import PIL
+from PIL import Image
 import numpy as np
 import torch
 import torchvision.transforms as T
@@ -331,6 +333,168 @@ class Normalize(object):
             boxes = boxes / torch.tensor([w, h, w, h], dtype=torch.float32)
             target["boxes"] = boxes
         return image, target
+
+
+def _box_iou_np(box, boxes):
+    """IoU of one xyxy box [4] against an [N,4] xyxy array. Returns [N]."""
+    if len(boxes) == 0:
+        return np.zeros((0,), dtype=np.float32)
+    x1 = np.maximum(box[0], boxes[:, 0])
+    y1 = np.maximum(box[1], boxes[:, 1])
+    x2 = np.minimum(box[2], boxes[:, 2])
+    y2 = np.minimum(box[3], boxes[:, 3])
+    inter = np.clip(x2 - x1, 0, None) * np.clip(y2 - y1, 0, None)
+    a0 = max(box[2] - box[0], 0) * max(box[3] - box[1], 0)
+    a1 = np.clip(boxes[:, 2] - boxes[:, 0], 0, None) * np.clip(boxes[:, 3] - boxes[:, 1], 0, None)
+    return inter / np.clip(a0 + a1 - inter, 1e-6, None)
+
+
+class CopyPasteShrink(object):
+    """Copy-paste-shrink augmentation: inject synthetic SMALL pseudo-boxes.
+
+    Runs AFTER the geometric transforms and BEFORE Normalize, so the image is a
+    PIL image at final network resolution and boxes are xyxy ABSOLUTE pixels.
+    It copies an existing pseudo-box crop, shrinks it to a sampled target area
+    (in that post-resize pixel space), pastes it at a low-IoU location, and
+    registers the paste as a new pseudo-box (pseudo_mask=1) so it flows through
+    the exact same downstream path (DTQT/DN, matching, pseudo loss) as the real
+    pseudo-boxes. Only inserted into the pipeline when cps_enable=True; the stock
+    path never constructs it.
+
+    Pasted boxes inherit their source pseudo-box's label (-1). All pseudo-boxes
+    already share label -1 (category_id=-1 in OW_COCO_R2.json), so no downstream
+    consumer requires per-row label uniqueness.
+    """
+
+    def __init__(self, num_pastes=2, prob=1.0, target_area_min=200.0,
+                 target_area_max=1024.0, source_max_side=80.0, feather_px=3,
+                 weight_scale=1.0, max_downscale=6.0, max_place_tries=50):
+        self.num_pastes = num_pastes
+        self.prob = prob
+        self.target_area_min = float(target_area_min)
+        self.target_area_max = float(target_area_max)
+        self.source_max_side = float(source_max_side)
+        self.feather_px = int(feather_px)
+        self.weight_scale = float(weight_scale)
+        self.max_downscale = float(max_downscale)
+        self.max_place_tries = int(max_place_tries)
+        self.stats = None  # optional dict populated by the smoke harness
+
+    def _feather_alpha(self, h, w):
+        if self.feather_px <= 0:
+            return np.ones((h, w, 1), dtype=np.float32)
+        yy = np.minimum(np.arange(h), np.arange(h)[::-1]).reshape(h, 1)
+        xx = np.minimum(np.arange(w), np.arange(w)[::-1]).reshape(1, w)
+        d = np.minimum(yy, xx).astype(np.float32)  # distance to nearest edge
+        sigma = self.feather_px / 2.0
+        alpha = 1.0 - np.exp(-(d * d) / (2.0 * sigma * sigma))
+        return alpha.reshape(h, w, 1).astype(np.float32)
+
+    def __call__(self, image, target):
+        if random.random() >= self.prob:
+            return image, target
+        if "boxes" not in target or "pseudo_mask" not in target:
+            return image, target
+        boxes = target["boxes"]
+        pmask = target["pseudo_mask"].to(torch.bool)
+        if boxes.numel() == 0 or int(pmask.sum()) == 0:
+            return image, target
+
+        boxes_np = boxes.numpy()
+        W, H = image.size
+        rgb = image.convert("RGB")
+        img_np = np.asarray(rgb).astype(np.float32)
+
+        pmask_np = pmask.numpy()
+        pseudo_boxes = boxes_np[pmask_np]
+        pseudo_weights = target["weight"][pmask].numpy()
+        sides = np.maximum(pseudo_boxes[:, 2] - pseudo_boxes[:, 0],
+                           pseudo_boxes[:, 3] - pseudo_boxes[:, 1])
+        qualified = np.nonzero(sides <= self.source_max_side)[0]
+        smallest = int(np.argmin(sides))  # fallback pool: smallest available
+
+        forbidden = list(boxes_np)  # all GT + pseudo boxes, xyxy-abs
+        pasted_boxes, pasted_weights = [], []
+        attempted = placed = fallback = 0
+
+        for _ in range(self.num_pastes):
+            attempted += 1
+            if len(qualified) > 0:
+                si = int(random.choice(qualified))
+            else:
+                si = smallest
+                fallback += 1
+            sx1, sy1, sx2, sy2 = pseudo_boxes[si]
+            sw, sh = sx2 - sx1, sy2 - sy1
+            if sw < 1 or sh < 1:
+                continue
+            target_area = random.uniform(self.target_area_min, self.target_area_max)
+            f = math.sqrt(target_area / (sw * sh))
+            f = min(f, 1.0)  # never upscale; we want small pastes
+            if f < 1.0 / self.max_downscale:
+                continue  # downscale cap prevents reaching the target -> skip
+            nw = max(1, int(round(sw * f)))
+            nh = max(1, int(round(sh * f)))
+            cx1, cy1 = int(round(max(0, sx1))), int(round(max(0, sy1)))
+            cx2, cy2 = int(round(min(W, sx2))), int(round(min(H, sy2)))
+            if cx2 - cx1 < 1 or cy2 - cy1 < 1:
+                continue
+            crop = rgb.crop((cx1, cy1, cx2, cy2)).resize((nw, nh), Image.Resampling.LANCZOS)
+            crop_np = np.asarray(crop).astype(np.float32)
+            alpha = self._feather_alpha(nh, nw)
+
+            cand = None
+            for _try in range(self.max_place_tries):
+                if W - nw <= 0 or H - nh <= 0:
+                    break
+                px, py = random.randint(0, W - nw), random.randint(0, H - nh)
+                c = np.array([px, py, px + nw, py + nh], dtype=np.float32)
+                ious = _box_iou_np(c, np.asarray(forbidden, dtype=np.float32))
+                if ious.size == 0 or ious.max() < 0.2:
+                    cand = c
+                    break
+            if cand is None:
+                continue
+
+            px, py = int(cand[0]), int(cand[1])
+            region = img_np[py:py + nh, px:px + nw, :]
+            img_np[py:py + nh, px:px + nw, :] = region * (1.0 - alpha) + crop_np * alpha
+            forbidden.append(cand)
+            pasted_boxes.append([float(cand[0]), float(cand[1]), float(cand[2]), float(cand[3])])
+            pasted_weights.append(float(pseudo_weights[si]) * self.weight_scale)
+            placed += 1
+
+        if self.stats is not None:
+            self.stats["images"] += 1
+            self.stats["attempted"] += attempted
+            self.stats["placed"] += placed
+            self.stats["fallback"] += fallback
+            self.stats["areas"].extend(
+                (b[2] - b[0]) * (b[3] - b[1]) for b in pasted_boxes
+            )
+
+        if placed == 0:
+            return image, target
+
+        out_img = Image.fromarray(np.clip(img_np, 0, 255).astype(np.uint8), mode="RGB")
+        pb = torch.as_tensor(pasted_boxes, dtype=boxes.dtype)
+        n = len(pasted_boxes)
+        target = target.copy()
+        target["boxes"] = torch.cat([boxes, pb], dim=0)
+        target["labels"] = torch.cat(
+            [target["labels"], torch.full((n,), -1, dtype=target["labels"].dtype)]
+        )
+        target["pseudo_mask"] = torch.cat(
+            [target["pseudo_mask"], torch.ones(n, dtype=target["pseudo_mask"].dtype)]
+        )
+        target["weight"] = torch.cat(
+            [target["weight"], torch.as_tensor(pasted_weights, dtype=target["weight"].dtype)]
+        )
+        if "area" in target:
+            pa = torch.as_tensor([(x2 - x1) * (y2 - y1) for x1, y1, x2, y2 in pasted_boxes],
+                                 dtype=target["area"].dtype)
+            target["area"] = torch.cat([target["area"], pa])
+        return out_img, target
 
 
 class Compose(object):
