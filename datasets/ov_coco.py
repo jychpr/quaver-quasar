@@ -172,22 +172,37 @@ def make_coco_transforms(image_set, args):
     normalize = T.Compose([T.ToRGB(), T.ToTensor(), T.Normalize(MEAN, STD)])
     scales = [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
     if image_set == "train":
-        return T.Compose(
-            [
-                T.RandomHorizontalFlip(),
-                T.RandomSelect(
-                    T.RandomResize(scales, max_size=1333),
-                    T.Compose(
-                        [
-                            T.RandomResize([400, 500, 600]),
-                            T.RandomSizeCrop(384, 600),
-                            T.RandomResize(scales, max_size=1333),
-                        ]
-                    ),
+        transforms = [
+            T.RandomHorizontalFlip(),
+            T.RandomSelect(
+                T.RandomResize(scales, max_size=1333),
+                T.Compose(
+                    [
+                        T.RandomResize([400, 500, 600]),
+                        T.RandomSizeCrop(384, 600),
+                        T.RandomResize(scales, max_size=1333),
+                    ]
                 ),
-                normalize,
-            ]
-        )
+            ),
+        ]
+        # copy-paste-shrink: inject synthetic small pseudo-boxes after the
+        # geometric transforms (final-resolution xyxy-abs space), before normalize.
+        # Off by default -> the transform is never inserted, so the pipeline is
+        # byte-identical to stock.
+        if getattr(args, "cps_enable", False):
+            transforms.append(
+                T.CopyPasteShrink(
+                    num_pastes=getattr(args, "cps_num_pastes", 2),
+                    prob=getattr(args, "cps_prob", 1.0),
+                    target_area_min=getattr(args, "cps_target_area_min", 200),
+                    target_area_max=getattr(args, "cps_target_area_max", 1024),
+                    source_max_side=getattr(args, "cps_source_max_side", 80),
+                    feather_px=getattr(args, "cps_feather_px", 3),
+                    weight_scale=getattr(args, "cps_weight_scale", 1.0),
+                )
+            )
+        transforms.append(normalize)
+        return T.Compose(transforms)
     if image_set == "val":
         return T.Compose(
             [
